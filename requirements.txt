@@ -1,0 +1,6 @@
+newspaper3k
+mediacloud
+lxml_html_clean
+ftfy
+PySocks
+pandas

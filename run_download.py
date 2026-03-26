@@ -25,8 +25,8 @@ import os
 from argparse import Namespace
 from collections import namedtuple, Counter
 from concurrent import futures
-import mediacloud.tags
 import mediacloud.api
+import mediacloud.error
 import newspaper
 import requests
 from ftfy import fix_text
@@ -35,7 +35,6 @@ from tqdm import tqdm
 from media_list import Media
 
 import socks
-import requests
 import socket
 
 from utils import handle_dirs
@@ -48,6 +47,7 @@ Story = namedtuple('Story', ['id',
                              'author',
                              'media',
                              'media_url',
+                             'story_url',
                              'pub_date',
                              'stories_id',
                              'guid',
@@ -104,9 +104,9 @@ def save_as_json(save_dir, json_file_name, content):
     """
     handle_dirs(save_dir)
     json_file_path = os.path.join(save_dir, json_file_name)
-    fp = open(json_file_path, 'w+')
-    fp.write(json.dumps(content._asdict(), indent=2))
-    fp.close()
+    with open(json_file_path, 'w+', encoding='utf-8') as fp:
+        # Convert date/datetime values (eg publish_date) to ISO strings.
+        fp.write(json.dumps(content._asdict(), indent=2, default=str))
     # print("Save as json successfully!")
 
 
@@ -133,44 +133,125 @@ def set_themes(stories):
     :return:
     """
     for s in stories:
-        theme_tag_names = ','.join(
-            [t['tag'] for t in s['story_tags'] if t['tag_sets_id'] == mediacloud.tags.TAG_SET_NYT_THEMES])
-        s['themes'] = theme_tag_names
+        # Tags are not returned by the new API; preserve key for downstream compatibility.
+        s['themes'] = ''
     return stories
 
 
-def stories_about_topic(api_gen, mc, query, period, fetch_size=10, limit=10):
+def story_list_compat(mc, query, start_date, end_date, source_id=None, collection_ids=None, pagination_token=None, page_size=10):
+    """Compatibility wrapper for client versions that build tuple params for `ss`/`cs`."""
+    source_ids = [source_id] if source_id is not None else []
+    params = mc._prep_default_params(query, start_date, end_date, source_ids=source_ids, collection_ids=collection_ids)
+    if isinstance(params.get('ss'), tuple):
+        params['ss'] = params['ss'][0]
+    if isinstance(params.get('cs'), tuple):
+        params['cs'] = params['cs'][0]
+    if pagination_token:
+        params['pagination_token'] = pagination_token
+    if page_size:
+        params['page_size'] = page_size
+
+    # Use a local request flow so non-JSON error pages don't crash with JSONDecodeError.
+    endpoint_url = mc.BASE_API_URL + 'search/story-list'
+    response = mc._session.get(endpoint_url, params=params, timeout=mc.TIMEOUT_SECS)
+    results = None
+    parse_error = None
+    try:
+        results = response.json()
+    except ValueError as exc:
+        parse_error = exc
+
+    if response.status_code != 200:
+        # Preserve HTTP error semantics (especially 429) even when the body is empty/non-JSON.
+        error_data = results if isinstance(results, dict) else {}
+        raise mediacloud.error.APIResponseError(response, params, error_data)
+
+    if parse_error is not None:
+        body_preview = response.text[:200].replace('\n', ' ')
+        raise RuntimeError(
+            f"MediaCloud returned non-JSON response for story-list (status={response.status_code}). "
+            f"Body preview: {body_preview!r}"
+        ) from parse_error
+
+    if not isinstance(results, dict) or 'stories' not in results:
+        raise RuntimeError("MediaCloud story-list response missing expected 'stories' field")
+
+    mc._dates_str2objects(results['stories'])
+    return results['stories'], results.get('pagination_token')
+
+
+def stories_about_topic(api_gen, mc, query, start_date, end_date, source_id, collection_ids, fetch_size=10, limit=10):
     """
     Return stories on certain topic from certain source, from start_time to end_time.
     :param mc: the media cloud client
     :param query: the query string
-    :param period: the requested time period
+    :param start_date: requested start date
+    :param end_date: requested end date
+    :param source_id: media source id to filter stories
+    :param collection_ids: collection ids to filter stories
     :param fetch_size:
     :param limit: max number of return stories
-    :return: a list of stories
+    :return: a tuple of (list of stories, active media cloud client)
     """
 
-    more_stories = True
     stories = []
-    last_id = 0
-    fetched_stories = []
+    pagination_token = None
+    use_source_ids = True
 
-    while more_stories:
+    while True:
         try:
-            fetched_stories = mc.storyList(query, period, last_id, rows=fetch_size, sort='processed_stories_id')
-        except mediacloud.error.MCException as e:
-            if e.status_code == 429:
+            search_query = query
+            source_filter = source_id
+            if not use_source_ids:
+                search_query = f"{query} AND media_id:{source_id}"
+                source_filter = None
+
+            fetched_stories, pagination_token = story_list_compat(
+                mc,
+                search_query,
+                start_date,
+                end_date,
+                source_filter,
+                collection_ids=collection_ids,
+                pagination_token=pagination_token,
+                page_size=fetch_size,
+            )
+        except mediacloud.error.APIResponseError as e:
+            if e.response.status_code == 429:
                 print()
                 print("Switch media cloud account!")
                 print()
-                mc = mediacloud.api.MediaCloud(next(api_gen)[0])  # call the generator
-        if len(fetched_stories) == 0 or len(stories) > limit:
-            more_stories = False
-        else:
-            stories += fetched_stories
-            last_id = fetched_stories[-1]['processed_stories_id']
+                try:
+                    mc = mediacloud.api.SearchApi(next(api_gen)[0])  # call the generator
+                except StopIteration as exc:
+                    raise RuntimeError("All API keys exhausted while handling 429 responses") from exc
+                continue
+
+            error_note = ''
+            if isinstance(e.data, dict):
+                error_note = str(e.data.get('note', ''))
+            if e.response.status_code == 422 and use_source_ids and 'No sources found' in error_note:
+                print("Source id filter rejected by API; falling back to legacy media_id query filter.")
+                use_source_ids = False
+                pagination_token = None
+                stories = []
+                continue
+
+            raise
+
+        if len(fetched_stories) == 0:
+            break
+
+        stories += fetched_stories
+        if len(stories) >= limit:
+            stories = stories[:limit]
+            break
+
+        if pagination_token is None:
+            break
+
     stories = set_themes(stories)
-    return stories
+    return stories, mc
 
 
 def get_one_article(story, cur_topic, save_format='json'):
@@ -201,20 +282,23 @@ def get_one_article(story, cur_topic, save_format='json'):
             title = story['title']
             media_name = story['media_name']
             media_url = story['media_url']
+            story_url = story.get('url')
             pub_date = story['publish_date']
-            stories_id = story['stories_id']
-            guid = story['guid']
-            processed_stories_id = story['processed_stories_id']
+            # The new API returns `id` and no legacy guid/processed id fields.
+            stories_id = story.get('id')
+            guid = None
+            processed_stories_id = None
 
-            # hash the guid to get unique id
+            # Build a stable hash key from available fields in the new response.
             hash_obj = hashlib.blake2b(digest_size=20)
-            hash_obj.update(guid.encode('utf-8'))
+            hash_seed = f"{story.get('id', '')}|{story.get('url', '')}|{story.get('publish_date', '')}"
+            hash_obj.update(hash_seed.encode('utf-8'))
             hashed_id = hash_obj.hexdigest()
 
             # get authors from the story with newspaper
             author = article.authors
 
-            response = Story(hashed_id, title, author, media_name, media_url, pub_date, stories_id, guid,
+            response = Story(hashed_id, title, author, media_name, media_url, story_url, pub_date, stories_id, guid,
                              processed_stories_id, text)
     else:
         status = 'fail'
@@ -273,43 +357,28 @@ if __name__ == '__main__':
     # SET YOUR API KEYS IN THE TXT FILE !!!
     apis = get_list_of_APIs('api_key.txt')
     api_gen = (api for api in apis)
-    mc = mediacloud.api.MediaCloud(next(api_gen)[0])  # call the generator
+    mc = mediacloud.api.SearchApi(next(api_gen)[0])  # call the generator
 
     # SET YOUR QUERY TOPICS HERE !!!
-    query_topics = ["abortion", "gay marriage", "death penalty", "euthanasia", "border wall", "immigration ban",
-                    "sanctuary cities", "muslim surveillance", "no-fly list gun control", "drug policy",
-                    "net neutrality",
-                    "affirmative action", "social media regulation", "social security", "obamacare", "marijuana",
-                    "climate change",
-                    "paris climate agreement", "fracking", "minimum wage", "corporate tax", "equal pay", "welfare",
-                    "NAFTA", "tariffs", "china tariffs", "federal reserve", "farm subsidies", "bitcoin",
-                    "electoral college",
-                    "voter fraud", "campaign finance", "lobbyists", "military spending", "united nations", "torture",
-                    "NATO",
-                    "israel", "North Korea", "Ukraine", "Russia", "terrorism", "foreign aid", "drones", "Cuba",
-                    "student loans",
-                    "common core", "private prisons", "mandatory minimum prison sentences", "mandatory vaccinations",
-                    "GMO labels",
-                    "gerrymandering"]
-
+    query_topics = ["israel"]
+    collection_ids = ["34412234"]  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
     # SET YOUR PERIOD HERE !!!
-    start_date = datetime.date(2020, 1, 1)
-    end_date = datetime.date(2020, 12, 24)
-
-    period = mc.dates_as_query_clause(start_date, end_date)
+    start_date = datetime.date(2026, 1, 1)
+    end_date = datetime.date(2026, 1, 31)
 
     for topics in query_topics:
-        # for period in periods:
         for media in Media:
             cur_media_id = media.value
-            media_id = ''.join(["media_id:", str(cur_media_id)])
-            query = ''.join([topics, ' AND ', media_id])
-            res_stories = stories_about_topic(api_gen,
-                                              mc,
-                                              query,
-                                              period,
-                                              fetch_size=50,
-                                              limit=50)
+            query = topics
+            res_stories, mc = stories_about_topic(api_gen,
+                                                  mc,
+                                                  query,
+                                                  start_date,
+                                                  end_date,
+                                                  cur_media_id,
+                                                  collection_ids=collection_ids,
+                                                  fetch_size=50,
+                                                  limit=50)
             print("We have fetched {} stories from {} about {}".format(len(res_stories), media.name, topics))
             if len(res_stories) != 0:
                 story_responses = get_many_articles(topics, res_stories, save_format='json')

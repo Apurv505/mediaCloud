@@ -22,24 +22,24 @@ from enum import Enum
 # SET THE MEDIAS OF YOUR INTERESTS HERE !!!
 class Media(Enum):
     # Liberal
-    BBC = 1094
+    BBC = 932549
     CNN = 1095
     NYT = 1
-    NPR = 1096
-    WSP = 2
-    HUFF = 27502
-    GDN = 18629
+    # NPR = 1096
+    # WSP = 2
+    # HUFF = 27502
+    # GDN = 18629
 
     # Neutral
-    CNBC = 1755
-    USA = 4
-    WSJ = 1150
-    CBS = 1752
-    ABC = 1091
+    # CNBC = 1755
+    # USA = 4
+    # WSJ = 1150
+    # CBS = 1752
+    # ABC = 1091
 
     # Conservative
-    BLZ = 232790
-    RLS = 24669
-    SEA = 28136
+    # BLZ = 232790
+    # RLS = 24669
+    # SEA = 28136
     FOX = 1092
-    BRB = 19334
+    # BRB = 19334

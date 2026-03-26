@@ -316,7 +316,7 @@ if __name__ == '__main__':
     processes = min(processes_num, cpu_count())
 
     print()
-    for year in ['2020']:
+    for year in ['2021']:
         print(colorama.Fore.LIGHTBLUE_EX + "= Loading the dataset ... " + "Year: " + year)
         corpus = MediaCloud_DataReader('./output_' + year)
 
