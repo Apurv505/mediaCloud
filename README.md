@@ -1,3 +1,6 @@
+python run_download.py --language en   #Run this to filter language
+
+
 # Data Downloader for Media Cloud
 
 A simple but efficient framework to download millions of full-length news articles from well-known media outlets (BBC, NYT, etc.). High-quality language and well-organized paragraphs, which could serve as great corpus for studies on political polarization, propaganda detection, and style understanding. 

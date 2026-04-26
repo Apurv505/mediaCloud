@@ -18,11 +18,12 @@
 
 import csv
 import datetime
+import time
 import hashlib
 import json
 import multiprocessing
 import os
-from argparse import Namespace
+from argparse import Namespace, ArgumentParser
 from collections import namedtuple, Counter
 from concurrent import futures
 import mediacloud.api
@@ -33,13 +34,23 @@ from ftfy import fix_text
 from newspaper import Article
 from tqdm import tqdm
 from media_list import Media
+import trafilatura
+
 
 import socks
 import socket
 
 from utils import handle_dirs
 
-MAX_WORKERS = 1000
+
+def parse_args():
+    parser = ArgumentParser(description="Download MediaCloud stories with language filter and rate limiting.")
+    parser.add_argument('--language', type=str, default=None, help='Language code to filter stories (e.g., en, he, ar)')
+    parser.add_argument('--rate_limit', type=float, default=None, help='Minimum seconds between API requests (rate limit)')
+    parser.add_argument('--output_topic', type=str, default=None, help='Topic name for output directory (default: first query topic)')
+    return parser.parse_args()
+
+MAX_WORKERS = 1
 MAX_CPUS = multiprocessing.cpu_count()
 
 Story = namedtuple('Story', ['id',
@@ -180,7 +191,7 @@ def story_list_compat(mc, query, start_date, end_date, source_id=None, collectio
     return results['stories'], results.get('pagination_token')
 
 
-def stories_about_topic(api_gen, mc, query, start_date, end_date, source_id, collection_ids, fetch_size=10, limit=10):
+def stories_about_topic(api_gen, mc, query, start_date, end_date, source_id, collection_ids, fetch_size=10, limit=10, language=None, rate_limit=None):
     """
     Return stories on certain topic from certain source, from start_time to end_time.
     :param mc: the media cloud client
@@ -197,13 +208,17 @@ def stories_about_topic(api_gen, mc, query, start_date, end_date, source_id, col
     stories = []
     pagination_token = None
     use_source_ids = True
+    normalized_lang = language.lower().strip() if language else None
+
+    # Language filtering works reliably via search query syntax for story-list.
+    base_query = f"({query}) AND language:{normalized_lang}" if normalized_lang else query
 
     while True:
         try:
-            search_query = query
+            search_query = base_query
             source_filter = source_id
             if not use_source_ids:
-                search_query = f"{query} AND media_id:{source_id}"
+                search_query = f"{base_query} AND media_id:{source_id}"
                 source_filter = None
 
             fetched_stories, pagination_token = story_list_compat(
@@ -216,6 +231,17 @@ def stories_about_topic(api_gen, mc, query, start_date, end_date, source_id, col
                 pagination_token=pagination_token,
                 page_size=fetch_size,
             )
+
+            # Defensive fallback in case backend ignores language clause for some sources.
+            if normalized_lang:
+                fetched_stories = [
+                    s for s in fetched_stories
+                    if s.get('language') and
+                    str(s.get('language')).lower().startswith(normalized_lang)
+                ]
+
+            if rate_limit:
+                time.sleep(rate_limit)
         except mediacloud.error.APIResponseError as e:
             if e.response.status_code == 429:
                 print()
@@ -254,82 +280,94 @@ def stories_about_topic(api_gen, mc, query, start_date, end_date, source_id, col
     return stories, mc
 
 
+
 def get_one_article(story, cur_topic, save_format='json'):
     """
-    Return a dict that stores all the information extracted from url
-    :param cur_topic: current query topic
-    :param save_format: 'json' or 'txt', as file format
-    :param story: (story) a object from media cloud
-    :return: the text of the story
+    Save a dict with MediaCloud data, website content or error, in downloaded_stories/{year}/
     """
-    response = Response
     article = Article(story['url'])
-
-    if not article.is_media_news():
+    pub_date = story.get('publish_date')
+    year = None
+    if pub_date:
         try:
-            article.download()
-            article.parse()
-        except newspaper.ArticleException:
-            status = "fail"
-            return Response(response, status)
-        else:
-            text = fix_text(article.text)
-
-            # if no exception, set status to success
-            status = 'success'
-
-            # set attributes that story already has
-            title = story['title']
-            media_name = story['media_name']
-            media_url = story['media_url']
-            story_url = story.get('url')
-            pub_date = story['publish_date']
-            # The new API returns `id` and no legacy guid/processed id fields.
-            stories_id = story.get('id')
-            guid = None
-            processed_stories_id = None
-
-            # Build a stable hash key from available fields in the new response.
-            hash_obj = hashlib.blake2b(digest_size=20)
-            hash_seed = f"{story.get('id', '')}|{story.get('url', '')}|{story.get('publish_date', '')}"
-            hash_obj.update(hash_seed.encode('utf-8'))
-            hashed_id = hash_obj.hexdigest()
-
-            # get authors from the story with newspaper
-            author = article.authors
-
-            response = Story(hashed_id, title, author, media_name, media_url, story_url, pub_date, stories_id, guid,
-                             processed_stories_id, text)
+            year = str(pub_date)[:4]
+        except Exception:
+            year = 'unknown'
     else:
+        year = 'unknown'
+
+    # Build a stable hash key from available fields in the new response.
+    hash_obj = hashlib.blake2b(digest_size=20)
+    hash_seed = f"{story.get('id', '')}|{story.get('url', '')}|{story.get('publish_date', '')}"
+    hash_obj.update(hash_seed.encode('utf-8'))
+    hashed_id = hash_obj.hexdigest()
+
+    output_dir = os.path.join('downloaded_stories', year)
+    handle_dirs(output_dir)
+    json_file_name = os.path.join(output_dir, f"{hashed_id}.json")
+
+
+    def convert_datetimes(obj):
+        if isinstance(obj, dict):
+            return {k: convert_datetimes(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_datetimes(i) for i in obj]
+        elif isinstance(obj, datetime.datetime):
+            return obj.isoformat()
+        elif isinstance(obj, datetime.date):
+            return obj.isoformat()
+        else:
+            return obj
+
+    result = {
+        "mediacloud_data": convert_datetimes(story),
+        "website_content": None,
+        "error": None
+    }
+
+    try:
+        article.download()
+        article.parse()
+        text = fix_text(article.text)
+        result["website_content"] = text
+        status = 'success'
+    except Exception as e:
+        result["error"] = str(e)
         status = 'fail'
-        return Response(response, status)
-
-    if save_format == 'txt':
-        txt_file_name = ''.join([hashed_id, '.txt'])
-        save_as_txt(''.join(['output_2021/', cur_topic]), txt_file_name, text)
-    elif save_format == 'json':
-        json_file_name = ''.join([hashed_id, '.json'])
-        save_as_json(''.join(['output_2021/', cur_topic]), json_file_name, response)
-    elif save_format == 'csv':
-        csv_file_name = ''.join([hashed_id, '.csv'])
-        save_as_csv(''.join(['output_2021/', cur_topic]), csv_file_name, response)
-
-    return Response(response, status)
 
 
-def get_many_articles(cur_topics, stories, save_format='json'):
+    tmp_file_name = json_file_name + '.tmp'
+    with open(tmp_file_name, 'w', encoding='utf-8') as fp:
+        json.dump(result, fp, indent=2, ensure_ascii=False)
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(tmp_file_name, json_file_name)
+
+    return Response(result, status)
+
+
+def get_many_articles(cur_topics, stories, save_format='json', already_downloaded_hashes=None):
     responses = []
     counter = Counter()
     workers = min(MAX_WORKERS, len(stories))
 
+
     with futures.ThreadPoolExecutor(workers) as executor:
         to_do_map = {}
         for story in stories:
+            # Build hash for this story as in get_one_article
+            hash_obj = hashlib.blake2b(digest_size=20)
+            hash_seed = f"{story.get('id', '')}|{story.get('url', '')}|{story.get('publish_date', '')}"
+            hash_obj.update(hash_seed.encode('utf-8'))
+            hashed_id = hash_obj.hexdigest()
+            if already_downloaded_hashes and hashed_id in already_downloaded_hashes:
+                counter['skipped'] += 1
+                continue
             future = executor.submit(get_one_article, story, cur_topics, save_format)
             to_do_map[future] = story
         done_iter = futures.as_completed(to_do_map)
 
-        for future in tqdm(done_iter, total=len(stories), ascii=True):
+        for future in tqdm(done_iter, total=len(to_do_map), ascii=True):
             try:
                 res = future.result()
             except newspaper.ArticleException as article_exc:
@@ -352,7 +390,22 @@ def get_many_articles(cur_topics, stories, save_format='json'):
     return Responses(responses, counter)
 
 
+
+def get_downloaded_hashes(output_dir, topic):
+    topic_dir = os.path.join(output_dir, topic)
+    if not os.path.exists(topic_dir):
+        return set()
+    hashes = set()
+    for fname in os.listdir(topic_dir):
+        if fname.endswith('.json'):
+            hashes.add(fname.split('.')[0])
+    return hashes
+
+
 if __name__ == '__main__':
+
+
+    cli_args = parse_args()
 
     # SET YOUR API KEYS IN THE TXT FILE !!!
     apis = get_list_of_APIs('api_key.txt')
@@ -361,28 +414,46 @@ if __name__ == '__main__':
 
     # SET YOUR QUERY TOPICS HERE !!!
     query_topics = ["israel"]
-    collection_ids = ["34412234"]  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
+    # collection_ids = ["34412234"]  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
+    collection_ids = []  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
     # SET YOUR PERIOD HERE !!!
     start_date = datetime.date(2026, 1, 1)
     end_date = datetime.date(2026, 1, 31)
+
+    # Use CLI topic for output dir if provided
+    output_topic = cli_args.output_topic or query_topics[0]
+    already_downloaded_hashes = get_downloaded_hashes('output_2021', output_topic)
+
 
     for topics in query_topics:
         for media in Media:
             cur_media_id = media.value
             query = topics
-            res_stories, mc = stories_about_topic(api_gen,
-                                                  mc,
-                                                  query,
-                                                  start_date,
-                                                  end_date,
-                                                  cur_media_id,
-                                                  collection_ids=collection_ids,
-                                                  fetch_size=50,
-                                                  limit=50)
+            res_stories, mc = stories_about_topic(
+                api_gen,
+                mc,
+                query,
+                start_date,
+                end_date,
+                cur_media_id,
+                collection_ids=collection_ids,
+                fetch_size=100,
+                limit=100,
+                language=cli_args.language,
+                rate_limit=cli_args.rate_limit
+            )
             print("We have fetched {} stories from {} about {}".format(len(res_stories), media.name, topics))
             if len(res_stories) != 0:
-                story_responses = get_many_articles(topics, res_stories, save_format='json')
-                print("Finished! {} success, and {} failure".format(story_responses.count['success'],
-                                                                    story_responses.count['fail']))
+                story_responses = get_many_articles(
+                    topics,
+                    res_stories,
+                    save_format='json',
+                    already_downloaded_hashes=already_downloaded_hashes
+                )
+                print("Finished! {} success, {} failure, {} skipped".format(
+                    story_responses.count['success'],
+                    story_responses.count['fail'],
+                    story_responses.count['skipped']
+                ))
                 print('*' * 40)
                 print()

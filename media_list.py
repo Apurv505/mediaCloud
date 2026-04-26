@@ -23,8 +23,8 @@ from enum import Enum
 class Media(Enum):
     # Liberal
     BBC = 932549
-    CNN = 1095
-    NYT = 1
+    # CNN = 1095
+    # NYT = 1
     # NPR = 1096
     # WSP = 2
     # HUFF = 27502
@@ -41,5 +41,5 @@ class Media(Enum):
     # BLZ = 232790
     # RLS = 24669
     # SEA = 28136
-    FOX = 1092
+    # FOX = 1092
     # BRB = 19334
