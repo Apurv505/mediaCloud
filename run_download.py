@@ -326,11 +326,29 @@ def get_one_article(story, cur_topic, save_format='json'):
     }
 
     try:
-        article.download()
-        article.parse()
-        text = fix_text(article.text)
-        result["website_content"] = text
-        status = 'success'
+        html = trafilatura.fetch_url(story['url'])
+        text = None
+        if html:
+            text = trafilatura.extract(
+                html,
+                url=story['url'],
+                include_comments=False,
+                include_tables=True,
+                favor_recall=True,
+            )
+
+        if text:
+            result["website_content"] = fix_text(text).strip()
+            status = 'success'
+        else:
+            article.download()
+            article.parse()
+            text = fix_text(article.text).strip()
+            if text:
+                result["website_content"] = text
+                status = 'success'
+            else:
+                raise ValueError("No website text could be extracted")
     except Exception as e:
         result["error"] = str(e)
         status = 'fail'
@@ -437,8 +455,8 @@ if __name__ == '__main__':
                 end_date,
                 cur_media_id,
                 collection_ids=collection_ids,
-                fetch_size=100,
-                limit=100,
+                fetch_size=10,
+                limit=10,
                 language=cli_args.language,
                 rate_limit=cli_args.rate_limit
             )

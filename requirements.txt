@@ -4,3 +4,4 @@ lxml_html_clean
 ftfy
 PySocks
 pandas
+trafilatura
