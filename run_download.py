@@ -433,7 +433,7 @@ if __name__ == '__main__':
     # SET YOUR QUERY TOPICS HERE !!!
     query_topics = ["israel"]
     # collection_ids = ["34412234"]  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
-    collection_ids = []  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
+    collection_ids = [34412409]  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
     # SET YOUR PERIOD HERE !!!
     start_date = datetime.date(2026, 1, 1)
     end_date = datetime.date(2026, 1, 31)
