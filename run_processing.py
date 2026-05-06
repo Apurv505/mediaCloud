@@ -377,7 +377,8 @@ class MediaCloud_DataReader(CategorizedCorpusReader, CorpusReader):
         counts = nltk.FreqDist()
         tokens = nltk.FreqDist()
 
-        # Perform single pass over paragraphs, tokenize_pos and count
+        # Perform single pass over paragraphs, 
+        # ze_pos and count
         for para in self.paras(fileids, categories):
             counts['paras'] += 1
 
@@ -403,6 +404,15 @@ class MediaCloud_DataReader(CategorizedCorpusReader, CorpusReader):
 
 
 class Preprocessor(object):
+    @staticmethod
+    def clean_text_keep_letters(text):
+        import re
+        if text is None:
+            return text
+        # Keep all Unicode letters, numbers, whitespace, and basic punctuation
+        # Remove symbols like ★, ►, etc.
+        # This pattern keeps: letters, numbers, whitespace, . , ; : ! ? ( ) " ' - _
+        return re.sub(r"[^\w\s.,;:!?'\"()\-–—_äöüÄÖÜßéèêáàâíìîóòôúùûçñ]+", '', text)
     def __init__(self, corpus, target=None, **kwargs):
         """
         convert the corpus to dataframe, with corresponding attributes filled
@@ -461,13 +471,15 @@ class Preprocessor(object):
             print(f"  Skipped: website_content is empty or missing")
             return None
         mc = doc.get('mediacloud_data', {})
+        # Clean website_content: keep all letters (including German), numbers, whitespace, and basic punctuation
+        cleaned_content = self.clean_text_keep_letters(doc.get('website_content'))
         document = {
             'title': mc.get('title'),
             'author': mc.get('author'),
             'media': mc.get('media_name') or mc.get('media'),
             'media_label': None,  # will fill below
             'pubdate': mc.get('publish_date'),
-            'words': doc.get('website_content'),
+            'words': cleaned_content,
         }
         print(f"  Extracted fields: title={document['title']}, author={document['author']}, media={document['media']}, pubdate={document['pubdate']}")
         liberal = ['BBC', 'CNN', 'New York Times', 'NPR', 'Washington Post', 'HuffPost', 'guardiannews.com']
@@ -530,31 +542,165 @@ if __name__ == '__main__':
 
     print()
 
-    for year in ['2026']:
-        print(colorama.Fore.LIGHTBLUE_EX + "= Loading the dataset ... " + "Year: " + year)
-        corpus = MediaCloud_DataReader('./downloaded_stories/' + year)
+    # Automatically find all year folders in ./downloaded_stories
+    base_dir = './downloaded_stories'
+    year_folders = [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name)) and name.isdigit()]
 
-        category = picked_category if picked_category else corpus.categories()
-        print(f"Categories found: {category}")
-        # Use full paths for fileids
-        all_fileids = [os.path.join('./downloaded_stories', year, fname) for fname in os.listdir(os.path.join('./downloaded_stories', year)) if fname.endswith('.json')]
+    import glob
+    for year in sorted(year_folders):
+        print(colorama.Fore.LIGHTBLUE_EX + f"= Loading the dataset ... Year: {year}")
+        year_path = os.path.join(base_dir, year)
+        corpus = MediaCloud_DataReader(year_path)
+
+        # Recursively find all .json files in year_path (including media subfolders)
+        all_fileids = glob.glob(os.path.join(year_path, '**', '*.json'), recursive=True)
         print(f"Fileids found: {all_fileids}")
         print()
         print(colorama.Fore.LIGHTBLUE_EX + "= Showing the dataset statistics:")
         # corpus.show_stats(categories=category)
         print()
 
+        # Create output year folder and readme.txt if not exists
+        output_year_dir = os.path.join(f'csv_output_{year}')
+        if not os.path.exists(output_year_dir):
+            os.makedirs(output_year_dir)
+        readme_path = os.path.join(output_year_dir, 'readme.txt')
+        if not os.path.exists(readme_path):
+            with open(readme_path, 'w', encoding='utf-8') as f:
+                # Try to copy query from downloaded_stories/{year}/readme.txt if exists
+                input_readme = os.path.join(year_path, 'readme.txt')
+                if os.path.exists(input_readme):
+                    with open(input_readme, 'r', encoding='utf-8') as fin:
+                        f.write(fin.read())
+                else:
+                    f.write(f"Processed data for year {year}\n")
+
         since = time.time()
-        preprocessor = Preprocessor(corpus, './csv_output_' + year + '/')
-        print(colorama.Fore.LIGHTBLUE_EX + "= Preprocessing ...")
-        # If no categories, process all files directly
-        if not category:
-            print("No categories found, processing all files directly.")
-            preprocessor.transform(thread_num=processes, fileids=all_fileids, categories=None)
+
+
+
+# Move PreprocessorSameStructure to module level for multiprocessing compatibility
+class PreprocessorSameStructure(Preprocessor):
+    def combine_media_csvs(self):
+        """
+        For each media folder in output_year_dir, combine all CSVs into combined.csv, adding year and media columns.
+        """
+        import os
+        import pandas as pd
+        year = os.path.basename(self.output_year_dir).replace('csv_output_', '')
+        for root, dirs, files in os.walk(self.output_year_dir):
+            # Only process media folders (not year root)
+            if root == self.output_year_dir:
+                continue
+            csv_files = [f for f in files if f.endswith('.csv') and f != 'combined.csv']
+            if not csv_files:
+                continue
+            dfs = []
+            media = os.path.basename(root)
+            for csv_file in csv_files:
+                csv_path = os.path.join(root, csv_file)
+                try:
+                    df = pd.read_csv(csv_path)
+                    df['year'] = year
+                    df['media_folder'] = media
+                    dfs.append(df)
+                except Exception as e:
+                    print(f"Error reading {csv_path}: {e}")
+            if dfs:
+                combined_df = pd.concat(dfs, ignore_index=True)
+                combined_path = os.path.join(root, 'combined.csv')
+                combined_df.to_csv(combined_path, index=False)
+                print(f"Combined CSV written to {combined_path}")
+    def __init__(self, corpus, target, year_path, output_year_dir, **kwargs):
+        super().__init__(corpus, target, **kwargs)
+        self.year_path = year_path
+        self.output_year_dir = output_year_dir
+
+    def transform(self, fileids=None, categories=None, thread_num=2):
+        def save_single_result(args):
+            fileid, doc = args
+            if doc:
+                rel_path = os.path.relpath(fileid, self.year_path)
+                rel_csv = rel_path[:-5] + '.csv' if rel_path.endswith('.json') else rel_path + '.csv'
+                out_path = os.path.join(self.output_year_dir, rel_csv)
+                out_dir = os.path.dirname(out_path)
+                if not os.path.exists(out_dir):
+                    os.makedirs(out_dir)
+                df = pd.DataFrame([doc])
+                df.to_csv(out_path, index=False)
+
+        if fileids is not None and categories is None:
+            print("Processing all provided fileids as a single batch.")
+            with Pool(thread_num) as proc:
+                results = list(tqdm(proc.imap(self.process, fileids), total=len(fileids)))
+            for fileid, doc in zip(fileids, results):
+                save_single_result((fileid, doc))
         else:
-            preprocessor.transform(thread_num=processes, categories=category)
+            with Pool(thread_num) as proc:
+                for cate in categories:
+                    print("preprocessing topic:", cate)
+                    fileid_list = self.get_fileids(fileids, cate)
+                    results = list(
+                        tqdm(proc.imap(self.process, fileid_list),
+                             total=self.get_fileids_size(categories=cate)))
+                    for fileid, doc in zip(fileid_list, results):
+                        save_single_result((fileid, doc))
+                    print()
+
+# Main loop
+if __name__ == '__main__':
+    colorama.init(autoreset=True)
+
+    # picked_category = ['drones', 'abortion']  # if you want all topics, set to None
+    picked_category = None
+    processes_num = 20
+    processes = min(processes_num, cpu_count())
+
+    print()
+
+    # Automatically find all year folders in ./downloaded_stories
+    base_dir = './downloaded_stories'
+    year_folders = [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name)) and name.isdigit()]
+
+    import glob
+    for year in sorted(year_folders):
+        print(colorama.Fore.LIGHTBLUE_EX + f"= Loading the dataset ... Year: {year}")
+        year_path = os.path.join(base_dir, year)
+        corpus = MediaCloud_DataReader(year_path)
+
+        # Recursively find all .json files in year_path (including media subfolders)
+        all_fileids = glob.glob(os.path.join(year_path, '**', '*.json'), recursive=True)
+        print(f"Fileids found: {all_fileids}")
+        print()
+        print(colorama.Fore.LIGHTBLUE_EX + "= Showing the dataset statistics:")
+        # corpus.show_stats(categories=category)
+        print()
+
+        # Create output year folder and readme.txt if not exists
+        output_year_dir = os.path.join(f'csv_output_{year}')
+        if not os.path.exists(output_year_dir):
+            os.makedirs(output_year_dir)
+        readme_path = os.path.join(output_year_dir, 'readme.txt')
+        if not os.path.exists(readme_path):
+            with open(readme_path, 'w', encoding='utf-8') as f:
+                # Try to copy query from downloaded_stories/{year}/readme.txt if exists
+                input_readme = os.path.join(year_path, 'readme.txt')
+                if os.path.exists(input_readme):
+                    with open(input_readme, 'r', encoding='utf-8') as fin:
+                        f.write(fin.read())
+                else:
+                    f.write(f"Processed data for year {year}\n")
+
+        since = time.time()
+
+        preprocessor = PreprocessorSameStructure(corpus, output_year_dir, year_path, output_year_dir)
+        print(colorama.Fore.LIGHTBLUE_EX + f"= Preprocessing {year} ...")
+        print("Processing all files recursively in year folder and saving CSVs in matching structure.")
+        preprocessor.transform(thread_num=processes, fileids=all_fileids, categories=None)
+        # Combine all CSVs per media folder after processing
+        preprocessor.combine_media_csvs()
         print()
 
         time_elapsed = time.time() - since
-        print(colorama.Fore.LIGHTGREEN_EX + "= Preprocessing is done!")
+        print(colorama.Fore.LIGHTGREEN_EX + f"= Preprocessing for {year} is done!")
         print('It takes {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))

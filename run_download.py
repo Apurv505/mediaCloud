@@ -16,6 +16,11 @@
 # limitations under the License.
 
 
+#We have main downloaded_stories folder and inside it each query creates a folder using the year. Then in each year we create a readme file 
+# and put the actual query we sent to media cloud to keep track. Then we create new folder based on which media we are downloading stories from and put 
+# the stories in there
+ 
+
 import csv
 import datetime
 import time
@@ -296,16 +301,31 @@ def get_one_article(story, cur_topic, save_format='json'):
     else:
         year = 'unknown'
 
+    # Get media name (safe for folder name)
+    media_name = story.get('media_name') or story.get('media', 'unknown_media')
+    # Clean media_name for filesystem
+    import re
+    media_name_clean = re.sub(r'[^\w\-_\. ]', '_', str(media_name))
+
     # Build a stable hash key from available fields in the new response.
     hash_obj = hashlib.blake2b(digest_size=20)
     hash_seed = f"{story.get('id', '')}|{story.get('url', '')}|{story.get('publish_date', '')}"
     hash_obj.update(hash_seed.encode('utf-8'))
     hashed_id = hash_obj.hexdigest()
 
-    output_dir = os.path.join('downloaded_stories', year)
-    handle_dirs(output_dir)
-    json_file_name = os.path.join(output_dir, f"{hashed_id}.json")
+    # Folder structure: downloaded_stories/{year}/readme.txt, then per-media subfolder, then stories inside media folder
+    year_dir = os.path.join('downloaded_stories', year)
+    handle_dirs(year_dir)
 
+    # Write readme.txt with the query if not exists
+    readme_path = os.path.join(year_dir, 'readme.txt')
+    if not os.path.exists(readme_path):
+        with open(readme_path, 'w', encoding='utf-8') as f:
+            f.write(f"Query: {cur_topic}\n")
+
+    media_dir = os.path.join(year_dir, media_name_clean)
+    handle_dirs(media_dir)
+    json_file_name = os.path.join(media_dir, f"{hashed_id}.json")
 
     def convert_datetimes(obj):
         if isinstance(obj, dict):
@@ -352,7 +372,6 @@ def get_one_article(story, cur_topic, save_format='json'):
     except Exception as e:
         result["error"] = str(e)
         status = 'fail'
-
 
     tmp_file_name = json_file_name + '.tmp'
     with open(tmp_file_name, 'w', encoding='utf-8') as fp:
@@ -431,12 +450,12 @@ if __name__ == '__main__':
     mc = mediacloud.api.SearchApi(next(api_gen)[0])  # call the generator
 
     # SET YOUR QUERY TOPICS HERE !!!
-    query_topics = ["israel"]
+    query_topics = ["merkel AND flucht*"]
     # collection_ids = ["34412234"]  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
-    collection_ids = [34412409]  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
+    collection_ids = []  # SET YOUR COLLECTION IDS HERE (OPTIONAL) !!!
     # SET YOUR PERIOD HERE !!!
-    start_date = datetime.date(2026, 1, 1)
-    end_date = datetime.date(2026, 1, 31)
+    start_date = datetime.date(2015, 1, 1)
+    end_date = datetime.date(2015, 12, 30)
 
     # Use CLI topic for output dir if provided
     output_topic = cli_args.output_topic or query_topics[0]
@@ -455,8 +474,8 @@ if __name__ == '__main__':
                 end_date,
                 cur_media_id,
                 collection_ids=collection_ids,
-                fetch_size=10,
-                limit=10,
+                fetch_size=5,
+                limit=100,
                 language=cli_args.language,
                 rate_limit=cli_args.rate_limit
             )
